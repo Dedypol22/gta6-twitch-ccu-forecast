@@ -14,7 +14,6 @@ OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z = [-1.645, -0.674, 0, 0.674, 1.645]
-SIGMA = 0.15
 
 
 def round2(x: float) -> float | int:
@@ -26,30 +25,6 @@ def round2(x: float) -> float | int:
     return int(value) if value.is_integer() else value
 
 
-def weighted_median(values: list[float], weights: list[float]) -> float:
-    if not values:
-        return 0.0
-    pairs = sorted(zip(values, weights), key=lambda x: x[0])
-    total_w = sum(w for v, w in pairs)
-    if total_w <= 0:
-        return values[len(values) // 2]
-    cum_w = 0.0
-    target = 0.5 * total_w
-    for v, w in pairs:
-        cum_w += w
-        if cum_w >= target:
-            return v
-    return pairs[-1][0]
-
-
-def weighted_std(values: list[float], weights: list[float], mean: float) -> float:
-    if not values or sum(weights) <= 0:
-        return SIGMA
-    total_w = sum(weights)
-    var = sum(w * (v - mean) ** 2 for v, w in zip(values, weights)) / total_w
-    return math.sqrt(max(0.0, var))
-
-
 def forecast_case(case: dict, name: str) -> dict:
     if case.get("levels") != LEVELS:
         raise ValueError(f"{name} asks for levels {case['levels']}, not {LEVELS}")
@@ -57,11 +32,13 @@ def forecast_case(case: dict, name: str) -> dict:
     if first is None:
         raise ValueError(f"{name} has no hour-1 print")
     p1 = max(1, first.get("viewers", 1))
+    lp1 = math.log(p1)
 
-    # Collect log-ratios per hour h (2..24) across comparables
+    # Collect data per hour
     comparables = case.get("comparables", [])
-    hour_data = {h: [] for h in range(2, 25)}
-    hour_weights = {h: [] for h in range(2, 25)}
+    hour_lr = {h: [] for h in range(2, 25)}
+    hour_x = {h: [] for h in range(2, 25)}
+    hour_kw = {h: [] for h in range(2, 25)}
 
     for comp in comparables:
         try:
@@ -75,25 +52,33 @@ def forecast_case(case: dict, name: str) -> dict:
             v1 = hourly[match_idx].get("viewers", 0)
             if v1 <= 0:
                 continue
-            log_v1 = math.log(v1)
+            lv1 = math.log(v1)
+            x = lv1 - lp1
 
-            # Weight determination
-            platforms = comp.get("platforms", "")
-            unlock = comp.get("unlock", "")
-            c_name = comp.get("name", "")
-            base_w = 1.0 if any(k in platforms.lower() for k in ["console", "playstation", "xbox"]) or "midnight" in unlock.lower() else 0.5
-            if "gta" in c_name.lower() and "vi" in c_name.lower():
-                weight = 0.5
-            else:
-                weight = base_w
+            # Base weight
+            platforms = comp.get("platforms", "").lower()
+            unlock = comp.get("unlock", "").lower()
+            c_name = comp.get("name", "").lower()
+            
+            w = 1.0 if any(k in platforms for k in ["console", "playstation", "xbox"]) or "midnight" in unlock else 0.5
+            if "gta" in c_name and "vi" in c_name:
+                w = 0.5
+            
+            # Platform multipliers
+            if ("playstation 5" in platforms or "ps5" in platforms) and "xbox" not in platforms:
+                w *= 1.5
+            elif "xbox" in platforms and not any(k in platforms for k in ["playstation", "ps"]):
+                w *= 0.75
+            
+            kw = w * math.exp(-((lv1 - lp1) / 2.0)**2)
 
             for h in range(2, 25):
-                pt = hourly[match_idx + h - 1]
-                vh = pt.get("viewers", 0)
+                vh = hourly[match_idx + h - 1].get("viewers", 0)
                 if vh > 0:
-                    lr = math.log(vh) - log_v1
-                    hour_data[h].append(lr)
-                    hour_weights[h].append(weight)
+                    lr = math.log(vh) - lv1
+                    hour_lr[h].append(lr)
+                    hour_x[h].append(x)
+                    hour_kw[h].append(kw)
         except Exception:
             continue
 
@@ -114,40 +99,51 @@ def forecast_case(case: dict, name: str) -> dict:
     m_vals = {}
     s_vals = {}
     for h in range(2, 25):
-        vals = hour_data[h]
-        weights = hour_weights[h]
-        if vals and sum(weights) > 0:
-            mh = weighted_median(vals, weights)
-            sh = weighted_std(vals, weights, mh)
+        lrs = hour_lr[h]
+        xs = hour_x[h]
+        kws = hour_kw[h]
+        total_kw = sum(kws)
+        
+        if total_kw > 0:
+            mean_lr = sum(lr * kw for lr, kw in zip(lrs, kws)) / total_kw
+            mean_x = sum(x * kw for x, kw in zip(xs, kws)) / total_kw
+            
+            num = sum(kw * (x - mean_x) * (lr - mean_lr) for x, lr, kw in zip(xs, lrs, kws))
+            den = sum(kw * (x - mean_x)**2 for x, kw in zip(xs, kws))
+            b = max(-1.0, min(1.0, num / den if den > 1e-9 else 0.0))
+            
+            mh = mean_lr - b * mean_x
+            
+            res_var = sum(kw * (lr - (mean_lr + b * (x - mean_x)))**2 for x, lr, kw in zip(xs, lrs, kws)) / total_kw
+            sh = math.sqrt(max(0.0, res_var))
             sh = max(0.15, min(0.8, sh))
         else:
             mh = 0.0
-            sh = SIGMA * math.sqrt(h - 1)
+            sh = 0.15 * math.sqrt(h - 1)
 
-        # Momentum nudge fading to 0 by hour 6
+        # Momentum nudge
         nudge = 0.25 * trend_clamped * max(0.0, (6 - h) / 4.0)
-        mh += nudge
-
-        m_vals[h] = mh
-        s_vals[h] = max(0.15, min(0.8, sh))
+        m_vals[h] = mh + nudge
+        s_vals[h] = sh
 
     hours_out = []
     for row in case.get("forecast", []):
         h = row.get("hour")
-        if h is None:
-            continue
+        if h is None: continue
         mh = m_vals.get(h, 0.0)
-        sh = s_vals.get(h, SIGMA * math.sqrt(h - 1))
-        q50 = p1 * math.exp(mh)
+        sh = s_vals.get(h, 0.15 * math.sqrt(h - 1))
+        
         q_list = []
         for z in Z:
-            q_val = q50 * math.exp(z * sh)
+            q_val = p1 * math.exp(mh + z * sh)
             q_val = max(0.01, min(1e9, q_val))
             q_list.append(q_val)
+        
         # Enforce non-decreasing
         for i in range(1, len(q_list)):
             if q_list[i] < q_list[i - 1]:
                 q_list[i] = q_list[i - 1]
+        
         hours_out.append({"hour": h, "q": [round2(q) for q in q_list]})
 
     return {"hours": hours_out}
